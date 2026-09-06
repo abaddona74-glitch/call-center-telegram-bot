@@ -1,0 +1,13 @@
+.env
+call_center.db
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+*.sqlite3
+.DS_Store
+Thumbs.db
