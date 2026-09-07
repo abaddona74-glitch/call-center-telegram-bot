@@ -1,5 +1,5 @@
 from aiogram import Router, F, Bot
-from aiogram.types import Message, CallbackQuery, ReplyKeyboardRemove
+from aiogram.types import Message, CallbackQuery, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
@@ -10,11 +10,19 @@ from keyboards import (
     get_operator_active_keyboard,
     get_customer_active_keyboard,
     get_customer_rating_keyboard,
-    get_ticket_claimed_keyboard
+    get_ticket_claimed_keyboard,
+    get_history_sessions_keyboard,
+    get_history_back_keyboard
 )
-from handlers.common import update_ticket_notifications_as_claimed, broadcast_new_ticket_to_operators
+from handlers.common import (
+    update_ticket_notifications_as_claimed, 
+    broadcast_new_ticket_to_operators,
+    clean_up_operator_session_messages
+)
 
 router = Router()
+
+OP_HISTORY_PER_PAGE = 10
 
 
 # ================= FSM HOLATLARI =================
@@ -116,6 +124,7 @@ async def process_op_code(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
     await db.register_or_update_operator(message.from_user.id, operator_name, code)
 
+    is_user_admin = (message.from_user.id in config.ADMIN_IDS)
     await message.answer(
         f"🎉 <b>Tabriklaymiz, siz muvaffaqiyatli ro'yxatdan o'tdingiz!</b>\n\n"
         f"👤 <b>Operator:</b> {operator_name}\n"
@@ -123,7 +132,7 @@ async def process_op_code(message: Message, state: FSMContext, bot: Bot):
         f"🏢 <b>Korxona:</b> «{config.COMPANY_NAME}»\n"
         f"📌 <b>Holatingiz:</b> 🟢 Onlayn (Mijoz kutish)\n\n"
         "<i>Yangi mijozlar murojaat qilganda sizga darhol qo'ng'iroq/qabul qilish xabari yuboriladi.</i>",
-        reply_markup=get_operator_idle_keyboard(is_available=True),
+        reply_markup=get_operator_idle_keyboard(is_available=True, is_admin=is_user_admin),
         parse_mode="HTML"
     )
 
@@ -138,20 +147,100 @@ async def process_op_code(message: Message, state: FSMContext, bot: Bot):
         )
 
 
-# ================= TEZKOR RO'YXATDAN O'TISH BUYRUG'I =================
+# ================= TEZKOR RO'YXATDAN O'TISH VA OPERATOR REJIMIGA O'TISH =================
 
-@router.message(Command("operator", "bind", "register"))
+@router.message(Command("operator", "op", "bind", "register"))
+@router.message(F.text == "🎧 Operator rejimiga o'tish")
 async def cmd_register_operator(message: Message, state: FSMContext, bot: Bot):
     """
-    Operator ulanishi:
-    Agar parametr berilmasa -> interaktiv so'rovnoma boshlanadi.
+    Operator rejimiga o'tish yoki ro'yxatdan o'tish:
+    1. Admin bo'lsa -> to'g'ridan-to'g'ri Operator rejimiga o'tkaziladi (onlayn qilinadi).
+    2. Allaqachon operator bo'lsa -> operator panelini chiqaradi.
+    3. Yangi bo'lsa -> interaktiv ro'yxatdan o'tishni boshlaydi.
     Format: /operator [parol] [Ism] [ID]
     """
-    args = message.text.split(maxsplit=3)
-    if len(args) == 1:
-        # Interaktiv rejim
+    user_id = message.from_user.id
+    is_user_admin = (user_id in config.ADMIN_IDS)
+    text = (message.text or "").strip()
+    args = text.split(maxsplit=3)
+
+    # Parametrlar berilmagan yoki tugma bosilgan holat
+    if len(args) == 1 or text == "🎧 Operator rejimiga o'tish":
+        if is_user_admin:
+            # Adminni tekshiramiz va avtomatik operator sifatida saqlaymiz/yangilaymiz
+            op = await db.get_operator(user_id)
+            if not op:
+                await db.register_or_update_operator(
+                    user_id, 
+                    message.from_user.full_name or "Admin", 
+                    "001"
+                )
+                op = await db.get_operator(user_id)
+            
+            # Agar oflayn bo'lsa, avtomatik ravishda onlaynga o'tkazamiz
+            if op["status"] == "offline":
+                await db.set_operator_status(user_id, "available")
+                op["status"] = "available"
+
+            code_badge = f" [#{op['operator_code']}]" if op.get("operator_code") else ""
+            active_sess = await db.get_active_session_by_operator(user_id)
+
+            if active_sess:
+                await message.answer(
+                    f"🎧 <b>Siz operator rejimidasiz!</b>\n\n"
+                    f"👤 Operator: <b>{op['full_name']}{code_badge}</b>\n"
+                    f"💬 Hozirda faol muloqotdasiz (Ticket #{active_sess['ticket_id']}).",
+                    reply_markup=get_operator_active_keyboard(),
+                    parse_mode="HTML"
+                )
+            else:
+                await message.answer(
+                    f"🎧 <b>Operator rejimiga o'tdingiz!</b>\n\n"
+                    f"👤 Operator: <b>{op['full_name']}{code_badge}</b>\n"
+                    f"📌 Holat: <b>🟢 Onlayn (Mijoz kutish)</b>\n\n"
+                    "Yangi murojaat kelishi bilan sizga <b>[📞 Qabul qilish]</b> tugmasi yuboriladi.\n\n"
+                    "<i>(Admin paneliga qaytish uchun: <b>/admin</b> yoki pastdagi <b>«👑 Admin paneliga qaytish»</b> tugmasini bosing)</i>",
+                    reply_markup=get_operator_idle_keyboard(is_available=True, is_admin=True),
+                    parse_mode="HTML"
+                )
+
+                # Agar navbatda kutayotgan mijoz bo'lsa darhol operatorga jo'natish
+                next_ticket = await db.get_next_waiting_ticket()
+                if next_ticket:
+                    await broadcast_new_ticket_to_operators(
+                        bot,
+                        next_ticket["id"],
+                        next_ticket["customer_name"],
+                        next_ticket.get("first_message", "")
+                    )
+            return
+
+        # Oddiy foydalanuvchi tekshiruvi
+        op = await db.get_operator(user_id)
+        if op:
+            code_str = f" [#{op['operator_code']}]" if op.get("operator_code") else ""
+            is_avail = (op["status"] != "offline")
+            active_sess = await db.get_active_session_by_operator(user_id)
+            if active_sess:
+                await message.answer(
+                    f"🎧 <b>Siz hozirda muloqotdasiz!</b> (Ticket #{active_sess['ticket_id']})",
+                    reply_markup=get_operator_active_keyboard(),
+                    parse_mode="HTML"
+                )
+            else:
+                await message.answer(
+                    f"🎧 <b>Operator paneli</b>\n\n"
+                    f"👤 Operator: <b>{op['full_name']}{code_str}</b>\n"
+                    f"📌 Holat: <b>{'🟢 Onlayn' if is_avail else '🔴 Oflayn'}</b>",
+                    reply_markup=get_operator_idle_keyboard(is_avail, is_admin=False),
+                    parse_mode="HTML"
+                )
+            return
+
+        # Ro'yxatdan o'tmagan bo'lsa -> interaktiv so'rovnoma
         await start_operator_registration_flow(message, state)
         return
+
     elif len(args) < 3:
         await message.answer(
             "❌ <b>Noto'g'ri format!</b>\n\n"
@@ -177,7 +266,7 @@ async def cmd_register_operator(message: Message, state: FSMContext, bot: Bot):
         f"Siz «{config.COMPANY_NAME}» call center operatori sifatida muvaffaqiyatli ro'yxatdan o'tdingiz.\n\n"
         f"Holatingiz: <b>🟢 Onlayn (Mijoz kutish)</b>\n"
         "Yangi mijozlar kelganda sizga xabar yuboriladi.",
-        reply_markup=get_operator_idle_keyboard(is_available=True),
+        reply_markup=get_operator_idle_keyboard(is_available=True, is_admin=is_user_admin),
         parse_mode="HTML"
     )
 
@@ -224,14 +313,20 @@ async def op_go_offline(message: Message):
 
     active_sess = await db.get_active_session_by_operator(message.from_user.id)
     if active_sess:
-        await message.answer("⚠️ Hozir suhbatdasiz! Avval suhbatni yakunlang.")
+        await message.answer(
+            f"⚠️ Hozir mijoz bilan muloqotdasiz (Ticket #{active_sess['ticket_id']})!\n\n"
+            "Suhbatni yakunlash uchun pastdagi <b>«🛑 Suhbatni yakunlash»</b> tugmasini bosing:",
+            reply_markup=get_operator_active_keyboard(),
+            parse_mode="HTML"
+        )
         return
 
+    is_user_admin = (message.from_user.id in config.ADMIN_IDS)
     await db.set_operator_status(message.from_user.id, "offline")
     await message.answer(
         "🔴 <b>Siz oflayn rejimdasiz (Tanaffus).</b>\n"
         "Sizga yangi mijozlar bildirishnomalari yuborilmaydi.",
-        reply_markup=get_operator_idle_keyboard(is_available=False),
+        reply_markup=get_operator_idle_keyboard(is_available=False, is_admin=is_user_admin),
         parse_mode="HTML"
     )
 
@@ -242,11 +337,21 @@ async def op_go_online(message: Message, bot: Bot):
     if not op:
         return
 
+    active_sess = await db.get_active_session_by_operator(message.from_user.id)
+    if active_sess:
+        await message.answer(
+            f"⚠️ Hozir mijoz bilan muloqotdasiz (Ticket #{active_sess['ticket_id']})!",
+            reply_markup=get_operator_active_keyboard(),
+            parse_mode="HTML"
+        )
+        return
+
+    is_user_admin = (message.from_user.id in config.ADMIN_IDS)
     await db.set_operator_status(message.from_user.id, "available")
     await message.answer(
         "🟢 <b>Siz onlayn rejimdasiz!</b>\n"
         "Yangi murojaatlar kelishi bilan sizga bildirishnoma yuboriladi.",
-        reply_markup=get_operator_idle_keyboard(is_available=True),
+        reply_markup=get_operator_idle_keyboard(is_available=True, is_admin=is_user_admin),
         parse_mode="HTML"
     )
 
@@ -277,10 +382,14 @@ async def op_status_info(message: Message):
     }
 
     code_str = f" [#{op['operator_code']}]" if op.get("operator_code") else ""
+    is_user_admin = (message.from_user.id in config.ADMIN_IDS)
+    reply_kb = get_operator_active_keyboard() if active_sess else get_operator_idle_keyboard(op["status"] != "offline", is_admin=is_user_admin)
+
     await message.answer(
         f"👤 <b>Operator:</b> {op['full_name']}{code_str}\n"
         f"📌 <b>Holat:</b> {status_labels.get(op['status'], op['status'])}\n"
         f"💬 <b>Faol muloqot:</b> {session_text}",
+        reply_markup=reply_kb,
         parse_mode="HTML"
     )
 
@@ -342,32 +451,73 @@ async def op_accept_ticket(callback: CallbackQuery, bot: Bot):
 
     customer_id = ticket["customer_id"]
     customer_name = ticket["customer_name"]
+    customer_username = ticket.get("customer_username") or ""
     op_name = op["full_name"]
     if op.get("operator_code"):
         op_name += f" (#{op['operator_code']})"
+
+    user_link = f'<a href="tg://user?id={customer_id}">{customer_name}</a>'
+    username_text = f"@{customer_username}" if customer_username else "<i>(Mavjud emas)</i>"
 
     await callback.answer("Mijoz qabul qilindi!")
 
     # 1. Boshqa operatorlardagi tugmani yangilash
     await update_ticket_notifications_as_claimed(bot, ticket_id, op_name, operator_id)
 
-    # 2. Ushbu operatorga tasdiq va aktiv klaviatura berish
+    # 2. Ushbu operatorga tasdiq va profil ma'lumotlarini berish
     try:
         await callback.message.edit_text(
-            f"✅ <b>Mijoz #{ticket_id} qabul qilindi!</b>\n"
-            f"👤 <b>Mijoz:</b> {customer_name}\n\n"
-            f"<i>Endi siz yozgan barcha xabarlar mijozga boradi. Suhbatni yakunlash uchun pastdagi tugmani bosing.</i>",
+            f"✅ <b>Mijoz #{ticket_id} qabul qilindi!</b>\n\n"
+            f"👤 <b>Mijoz:</b> {user_link}\n"
+            f"📱 <b>Telegram:</b> {username_text}\n"
+            f"🆔 <b>Telegram ID:</b> <code>{customer_id}</code>\n\n"
+            f"<i>Endi siz yozgan barcha xabarlar to'g'ridan-to'g'ri mijozga yetkaziladi.</i>",
             parse_mode="HTML"
         )
     except Exception:
         pass
 
-    await bot.send_message(
+    # Operatorga profil tugmasi (agar username bo'lsa)
+    inline_kb = None
+    if customer_username:
+        clean_user = customer_username.replace("@", "").strip()
+        if clean_user:
+            inline_kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text=f"👤 Mijoz profilini ochish (@{clean_user})", url=f"https://t.me/{clean_user}")
+            ]])
+
+    active_sess = await db.get_active_session_by_operator(operator_id)
+    sess_id = active_sess["id"] if active_sess else None
+    if sess_id and callback.message:
+        await db.track_session_message(sess_id, operator_id, callback.message.message_id)
+
+    info_msg = await bot.send_message(
         chat_id=operator_id,
-        text=f"💬 <b>{customer_name}</b> bilan muloqot boshlandi.",
+        text=(
+            f"💬 <b>{user_link} bilan muloqot boshlandi!</b>\n\n"
+            f"👤 <b>Ism:</b> {customer_name}\n"
+            f"📱 <b>Username:</b> {username_text}\n"
+            f"🆔 <b>Telegram ID:</b> <code>{customer_id}</code>\n\n"
+            f"<i>(Suhbatni yakunlash uchun pastdagi <b>«🛑 Suhbatni yakunlash»</b> tugmasini bosing)</i>"
+        ),
         reply_markup=get_operator_active_keyboard(),
         parse_mode="HTML"
     )
+    if sess_id and info_msg:
+        await db.track_session_message(sess_id, operator_id, info_msg.message_id)
+
+    if inline_kb:
+        try:
+            link_msg = await bot.send_message(
+                chat_id=operator_id,
+                text=f"🔗 <b>{customer_name}</b> profiliga to'g'ridan-to'g'ri havola:",
+                reply_markup=inline_kb,
+                parse_mode="HTML"
+            )
+            if sess_id and link_msg:
+                await db.track_session_message(sess_id, operator_id, link_msg.message_id)
+        except Exception:
+            pass
 
     # 3. Mijozga salomlashuv shabloni va faol klaviatura yuborish
     greeting_text = config.GREETING_TEMPLATE.format(
@@ -398,22 +548,31 @@ async def op_end_chat(message: Message, bot: Bot):
     if not op:
         return
 
+    is_user_admin = (operator_id in config.ADMIN_IDS)
     session = await db.close_session_by_operator(operator_id)
     if not session:
         await message.answer(
             "⚠️ Hozirda faol suhbat mavjud emas.",
-            reply_markup=get_operator_idle_keyboard(is_available=True)
+            reply_markup=get_operator_idle_keyboard(is_available=True, is_admin=is_user_admin)
         )
         return
 
     customer_id = session["customer_id"]
     ticket_id = session["ticket_id"]
+    sess_id = session["id"]
 
-    # Operatorga xabar
+    # "Suhbatni yakunlash" tugmasi xabarini ham o'chirish ro'yxatiga qo'shamiz
+    await db.track_session_message(sess_id, operator_id, message.message_id)
+
+    # Operator chatidagi barcha yozishmalarni tozalash (chat toza turishi uchun)
+    await clean_up_operator_session_messages(bot, sess_id, operator_id)
+
+    # Operatorga toza xabar
     await message.answer(
-        f"✅ <b>Mijoz #{ticket_id} bilan suhbat yakunlandi.</b>\n"
-        "Siz yana yangi mijozlarni qabul qilishga tayyorsiz.",
-        reply_markup=get_operator_idle_keyboard(is_available=True),
+        f"✅ <b>Mijoz #{ticket_id} bilan suhbat yakunlandi.</b>\n\n"
+        "🧹 <i>Suhbat xabarlari chatdan tozalandi.</i>\n"
+        "📜 <i>Yozishmalar tarixini istalgan payt <b>«📋 Mening suhbatlarim»</b> bo'limida ko'rishingiz mumkin.</i>",
+        reply_markup=get_operator_idle_keyboard(is_available=True, is_admin=is_user_admin),
         parse_mode="HTML"
     )
 
@@ -446,3 +605,178 @@ async def op_end_chat(message: Message, bot: Bot):
             next_ticket["customer_name"],
             next_ticket.get("first_message", "")
         )
+
+
+# ================= OPERATOR SUHBATLAR TARIXI =================
+
+async def build_op_history_list_text(sessions: list, total: int, page: int, op_name: str) -> str:
+    if not sessions:
+        return "📋 <b>Hozircha hech qanday yakunlangan suhbat mavjud emas.</b>"
+
+    start_num = page * OP_HISTORY_PER_PAGE + 1
+    text = (
+        f"📋 <b>{op_name} — suhbatlar tarixi ({total} ta)</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "<i>Suhbat tarixini ko'rish uchun tanlang:</i>\n\n"
+    )
+    for i, s in enumerate(sessions, start_num):
+        rating_str = f"{s['rating']} ⭐" if s.get("rating") else "—"
+        date_str = s["closed_at"].split()[0] if s.get("closed_at") and " " in s["closed_at"] else (s.get("closed_at") or "")
+        text += (
+            f"<b>{i}. Ticket #{s['ticket_id']}</b>\n"
+            f"  👤 Mijoz: {s['customer_name']}\n"
+            f"  📅 {date_str} | ⭐ {rating_str}\n"
+            "──────────────────────\n"
+        )
+    return text
+
+
+@router.message(F.text == "📋 Mening suhbatlarim")
+async def op_my_history(message: Message):
+    op = await db.get_operator(message.from_user.id)
+    if not op:
+        return
+
+    sessions, total = await db.get_operator_sessions(
+        message.from_user.id, limit=OP_HISTORY_PER_PAGE, offset=0
+    )
+    text = await build_op_history_list_text(sessions, total, 0, op["full_name"])
+    kb = get_history_sessions_keyboard(sessions, 0, total, OP_HISTORY_PER_PAGE, "op")
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("op_history_page:"))
+async def cb_op_history_page(callback: CallbackQuery):
+    op = await db.get_operator(callback.from_user.id)
+    if not op:
+        await callback.answer("Siz operator emassiz!", show_alert=True)
+        return
+
+    page = int(callback.data.split(":")[1])
+    offset = page * OP_HISTORY_PER_PAGE
+    sessions, total = await db.get_operator_sessions(
+        callback.from_user.id, limit=OP_HISTORY_PER_PAGE, offset=offset
+    )
+    text = await build_op_history_list_text(sessions, total, page, op["full_name"])
+    kb = get_history_sessions_keyboard(sessions, page, total, OP_HISTORY_PER_PAGE, "op")
+
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        await callback.answer()
+    except Exception:
+        await callback.answer("Ma'lumotlar o'zgarmagan.")
+
+
+@router.callback_query(F.data.startswith("op_history_view:"))
+async def cb_op_history_view(callback: CallbackQuery):
+    op = await db.get_operator(callback.from_user.id)
+    if not op:
+        await callback.answer("Siz operator emassiz!", show_alert=True)
+        return
+
+    session_id = int(callback.data.split(":")[1])
+    session = await db.get_session_by_id(session_id)
+    if not session:
+        await callback.answer("Suhbat topilmadi!", show_alert=True)
+        return
+
+    # Faqat o'z suhbatlarini ko'rishi mumkin
+    if session["operator_id"] != callback.from_user.id:
+        await callback.answer("Bu sizning suhbatingiz emas!", show_alert=True)
+        return
+
+    messages = await db.get_session_messages(session_id)
+
+    rating_str = f"{session['rating']} ⭐" if session.get("rating") else "Baholanmagan"
+    started = session.get("started_at", "")
+    closed = session.get("closed_at", "")
+
+    cust_id = session.get("customer_id")
+    cust_name = session.get("customer_name") or "Mijoz"
+    cust_user = session.get("customer_username") or ""
+    user_link = f'<a href="tg://user?id={cust_id}">{cust_name}</a>' if cust_id else cust_name
+    username_info = f" (@{cust_user})" if cust_user else ""
+    id_info = f" [<code>{cust_id}</code>]" if cust_id else ""
+
+    text = (
+        f"📋 <b>Suhbat tarixi: Ticket #{session['ticket_id']}</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>Mijoz:</b> {user_link}{username_info}{id_info}\n"
+        f"📅 <b>Sana:</b> {started} — {closed}\n"
+        f"⭐ <b>Baho:</b> {rating_str}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    )
+
+    if not messages:
+        text += "<i>Bu suhbatda saqlangan xabarlar mavjud emas.</i>\n"
+        text += "<i>(Tarix faqat shu funksiya qo'shilgandan keyingi suhbatlarda ishlaydi)</i>"
+    else:
+        for msg in messages:
+            time_str = msg["created_at"].split()[1][:5] if " " in msg["created_at"] else msg["created_at"]
+            if msg["sender_type"] == "customer":
+                sender_icon = "👤 Mijoz"
+            else:
+                sender_icon = "👨‍💼 Men"
+            content = msg["text_content"] or ""
+            if len(content) > 200:
+                content = content[:200] + "..."
+            text += f"<b>{sender_icon}</b> [{time_str}]: {content}\n"
+
+    text += "\n━━━━━━━━━━━━━━━━━━━━━━"
+
+    if len(text) > 4000:
+        text = text[:3950] + "\n\n<i>... (xabarlar juda ko'p, qisqartirildi)</i>"
+
+    media_files = await db.get_session_media_messages(session_id)
+    kb = get_history_back_keyboard(0, "op", session_id=session_id, media_count=len(media_files))
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        await callback.answer()
+    except Exception:
+        await callback.answer("Xatolik yuz berdi.")
+
+
+@router.callback_query(F.data.startswith("op_history_media:"))
+async def cb_op_history_media(callback: CallbackQuery, bot: Bot):
+    op = await db.get_operator(callback.from_user.id)
+    if not op:
+        await callback.answer("Siz operator emassiz!", show_alert=True)
+        return
+
+    session_id = int(callback.data.split(":")[1])
+    session = await db.get_session_by_id(session_id)
+    if not session or session["operator_id"] != callback.from_user.id:
+        await callback.answer("Ruxsat yo'q!", show_alert=True)
+        return
+
+    media_files = await db.get_session_media_messages(session_id)
+    if not media_files:
+        await callback.answer("Bu suhbatda yuklangan media fayllar yo'q.", show_alert=True)
+        return
+
+    await callback.answer(f"{len(media_files)} ta fayl yuborilmoqda...")
+
+    for item in media_files:
+        c_type = item["content_type"]
+        f_id = item["file_id"]
+        sender = "👤 Mijoz" if item["sender_type"] == "customer" else "👨‍💼 Men"
+        time_str = item["created_at"].split()[1][:5] if " " in item["created_at"] else ""
+        cap = f"{sender} [{time_str}]"
+
+        try:
+            if c_type == "audio":
+                await bot.send_audio(chat_id=callback.from_user.id, audio=f_id, caption=cap)
+            elif c_type == "voice":
+                await bot.send_voice(chat_id=callback.from_user.id, voice=f_id, caption=cap)
+            elif c_type == "photo":
+                await bot.send_photo(chat_id=callback.from_user.id, photo=f_id, caption=cap)
+            elif c_type == "video":
+                await bot.send_video(chat_id=callback.from_user.id, video=f_id, caption=cap)
+            elif c_type == "video_note":
+                await bot.send_video_note(chat_id=callback.from_user.id, video_note=f_id)
+            elif c_type == "document":
+                await bot.send_document(chat_id=callback.from_user.id, document=f_id, caption=cap)
+            elif c_type == "sticker":
+                await bot.send_sticker(chat_id=callback.from_user.id, sticker=f_id)
+        except Exception:
+            pass
