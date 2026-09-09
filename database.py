@@ -88,6 +88,12 @@ async def init_db():
         except Exception:
             pass
 
+        # feedback_reason ustuni mavjudligini ta'minlash (salbiy baho sababini saqlash)
+        try:
+            await db.execute("ALTER TABLE sessions ADD COLUMN feedback_reason TEXT DEFAULT '';")
+        except Exception:
+            pass
+
         # 6. Sessiyadagi xabarlarni kuzatish (yakunlanganda tozalash uchun)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS session_chat_messages (
@@ -95,6 +101,27 @@ async def init_db():
                 chat_id INTEGER NOT NULL,
                 message_id INTEGER NOT NULL,
                 PRIMARY KEY (session_id, chat_id, message_id)
+            )
+        """)
+
+        # 7. Foydalanuvchi sozlamalari (tanlangan til)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS user_settings (
+                user_id INTEGER PRIMARY KEY,
+                language TEXT NOT NULL DEFAULT 'uz',
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # 8. Tahrirlangan (edited) xabarlarni sinxronlashtirish uchun bog'langan xabarlar jadvali
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS relayed_messages (
+                session_id INTEGER NOT NULL,
+                source_chat_id INTEGER NOT NULL,
+                source_message_id INTEGER NOT NULL,
+                target_chat_id INTEGER NOT NULL,
+                target_message_id INTEGER NOT NULL,
+                PRIMARY KEY (source_chat_id, source_message_id)
             )
         """)
 
@@ -542,6 +569,16 @@ async def save_session_rating(ticket_id: int, rating: int):
         await db.commit()
 
 
+async def save_session_feedback(ticket_id: int, reason: str):
+    """Mijoz bergan salbiy baho sababini saqlash"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE sessions SET feedback_reason = ? WHERE ticket_id = ?",
+            (reason, ticket_id)
+        )
+        await db.commit()
+
+
 async def get_live_dashboard() -> Dict[str, Any]:
     """Jonli admin monitoringi: navbat, faol muloqotlar, operatorlar holati"""
     async with aiosqlite.connect(DB_PATH) as db:
@@ -721,6 +758,7 @@ async def get_session_by_id(session_id: int) -> Optional[Dict[str, Any]]:
                 s.operator_id,
                 s.status,
                 s.rating,
+                s.feedback_reason,
                 s.started_at,
                 s.closed_at,
                 q.customer_name,
@@ -736,37 +774,108 @@ async def get_session_by_id(session_id: int) -> Optional[Dict[str, Any]]:
             return dict(row) if row else None
 
 
-async def get_closed_sessions_list(limit: int = 20, offset: int = 0) -> Tuple[List[Dict[str, Any]], int]:
-    """Admin uchun barcha yopilgan suhbatlar ro'yxati (paginated)"""
+async def get_closed_sessions_list(
+    limit: int = 20, offset: int = 0, operator_id: Optional[int] = None
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Admin uchun barcha (yoki tanlangan operator bo'yicha) yopilgan suhbatlar ro'yxati (paginated)"""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
 
-        # Jami sonini olish
-        async with db.execute("SELECT COUNT(*) as c FROM sessions WHERE status = 'closed'") as cur:
-            total = (await cur.fetchone())["c"]
+        if operator_id:
+            # Muayyan operator bo'yicha
+            async with db.execute(
+                "SELECT COUNT(*) as c FROM sessions WHERE status = 'closed' AND operator_id = ?",
+                (operator_id,)
+            ) as cur:
+                total = (await cur.fetchone())["c"]
 
-        async with db.execute("""
-            SELECT 
-                s.id as session_id,
-                s.ticket_id,
-                s.customer_id,
-                s.rating,
-                s.started_at,
-                s.closed_at,
-                q.customer_name,
-                q.customer_username,
-                o.full_name as operator_name,
-                o.operator_code
-            FROM sessions s
-            JOIN queue q ON s.ticket_id = q.id
-            LEFT JOIN operators o ON s.operator_id = o.telegram_id
-            WHERE s.status = 'closed'
-            ORDER BY s.closed_at DESC
-            LIMIT ? OFFSET ?
-        """, (limit, offset)) as cur:
-            rows = [dict(r) for r in await cur.fetchall()]
+            async with db.execute("""
+                SELECT 
+                    s.id as session_id,
+                    s.ticket_id,
+                    s.customer_id,
+                    s.rating,
+                    s.feedback_reason,
+                    s.started_at,
+                    s.closed_at,
+                    q.customer_name,
+                    q.customer_username,
+                    o.full_name as operator_name,
+                    o.operator_code
+                FROM sessions s
+                JOIN queue q ON s.ticket_id = q.id
+                LEFT JOIN operators o ON s.operator_id = o.telegram_id
+                WHERE s.status = 'closed' AND s.operator_id = ?
+                ORDER BY s.closed_at DESC
+                LIMIT ? OFFSET ?
+            """, (operator_id, limit, offset)) as cur:
+                rows = [dict(r) for r in await cur.fetchall()]
+        else:
+            # Barcha operatorlar bo'yicha
+            async with db.execute("SELECT COUNT(*) as c FROM sessions WHERE status = 'closed'") as cur:
+                total = (await cur.fetchone())["c"]
+
+            async with db.execute("""
+                SELECT 
+                    s.id as session_id,
+                    s.ticket_id,
+                    s.customer_id,
+                    s.rating,
+                    s.feedback_reason,
+                    s.started_at,
+                    s.closed_at,
+                    q.customer_name,
+                    q.customer_username,
+                    o.full_name as operator_name,
+                    o.operator_code
+                FROM sessions s
+                JOIN queue q ON s.ticket_id = q.id
+                LEFT JOIN operators o ON s.operator_id = o.telegram_id
+                WHERE s.status = 'closed'
+                ORDER BY s.closed_at DESC
+                LIMIT ? OFFSET ?
+            """, (limit, offset)) as cur:
+                rows = [dict(r) for r in await cur.fetchall()]
 
         return rows, total
+
+
+async def get_operators_history_stats() -> List[Dict[str, Any]]:
+    """Admin uchun barcha operatorlar va ularning yopilgan suhbatlar soni"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT 
+                o.telegram_id,
+                o.full_name,
+                o.operator_code,
+                COUNT(s.id) as closed_count
+            FROM operators o
+            LEFT JOIN sessions s ON o.telegram_id = s.operator_id AND s.status = 'closed'
+            GROUP BY o.telegram_id, o.full_name, o.operator_code
+            ORDER BY closed_count DESC, o.full_name ASC
+        """) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def search_operators(query: str) -> List[Dict[str, Any]]:
+    """Ism yoki kod bo'yicha operatorlarni qidirish (suhbatlar soni bilan)"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        clean_q = f"%{query.strip().lower()}%"
+        async with db.execute("""
+            SELECT 
+                o.telegram_id,
+                o.full_name,
+                o.operator_code,
+                COUNT(s.id) as closed_count
+            FROM operators o
+            LEFT JOIN sessions s ON o.telegram_id = s.operator_id AND s.status = 'closed'
+            WHERE LOWER(o.full_name) LIKE ? OR LOWER(o.operator_code) LIKE ?
+            GROUP BY o.telegram_id, o.full_name, o.operator_code
+            ORDER BY closed_count DESC, o.full_name ASC
+        """, (clean_q, clean_q)) as cur:
+            return [dict(r) for r in await cur.fetchall()]
 
 
 async def get_operator_sessions(
@@ -789,6 +898,7 @@ async def get_operator_sessions(
                 s.ticket_id,
                 s.customer_id,
                 s.rating,
+                s.feedback_reason,
                 s.started_at,
                 s.closed_at,
                 q.customer_name,
@@ -802,3 +912,74 @@ async def get_operator_sessions(
             rows = [dict(r) for r in await cur.fetchall()]
 
         return rows, total
+
+
+# ================= FOYDALANUVCHI SOZLAMALARI (TIL) =================
+
+async def get_user_language(user_id: int) -> str:
+    """Foydalanuvchi tanlagan tilni olish (sukut bo'yicha 'uz')"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT language FROM user_settings WHERE user_id = ?", (user_id,)) as cur:
+            row = await cur.fetchone()
+            if row and row["language"]:
+                return row["language"]
+            return "uz"
+
+
+async def set_user_language(user_id: int, language: str) -> None:
+    """Foydalanuvchi tilini saqlash yoki yangilash"""
+    lang = language.lower().strip()
+    if lang not in ["uz", "ru"]:
+        lang = "uz"
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO user_settings (user_id, language, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id) DO UPDATE SET
+                language = excluded.language,
+                updated_at = CURRENT_TIMESTAMP
+        """, (user_id, lang))
+        await db.commit()
+
+
+async def has_user_selected_language(user_id: int) -> bool:
+    """Foydalanuvchi avval til tanlagan yoki yo'qligini tekshirish"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT 1 FROM user_settings WHERE user_id = ?", (user_id,)) as cur:
+            return (await cur.fetchone()) is not None
+
+
+# ================= BOG'LANGAN XABARLAR (TAHRIRLASH UCHUN) =================
+
+async def save_relayed_message(
+    session_id: int, 
+    source_chat_id: int, 
+    source_message_id: int, 
+    target_chat_id: int, 
+    target_message_id: int
+) -> None:
+    """Yuborilgan xabarni va uning ikkinchi tomonga yetkazilgan nusxasi ID sini saqlash"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO relayed_messages (session_id, source_chat_id, source_message_id, target_chat_id, target_message_id)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(source_chat_id, source_message_id) DO UPDATE SET
+                target_chat_id = excluded.target_chat_id,
+                target_message_id = excluded.target_message_id
+        """, (session_id, source_chat_id, source_message_id, target_chat_id, target_message_id))
+        await db.commit()
+
+
+async def get_relayed_message(source_chat_id: int, source_message_id: int) -> Optional[Dict[str, Any]]:
+    """Tahrirlanayotgan xabarga mos ikkinchi tomondagi xabarni topish"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT session_id, target_chat_id, target_message_id
+            FROM relayed_messages
+            WHERE source_chat_id = ? AND source_message_id = ?
+        """, (source_chat_id, source_message_id)) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+

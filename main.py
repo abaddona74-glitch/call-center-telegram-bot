@@ -60,13 +60,22 @@ async def auto_close_sessions_loop(bot: Bot):
                 # Mijozga bildirishnoma va baholash
                 try:
                     from keyboards import get_customer_rating_keyboard
-                    await bot.send_message(
-                        chat_id=cust_id,
-                        text=(
+                    cust_lang = await db.get_user_language(cust_id)
+                    if cust_lang == "ru":
+                        expire_text = (
+                            "⏱ <b>Время диалога (1 час) истекло.</b>\n\n"
+                            f"Спасибо за обращение в контакт-центр «{config.COMPANY_NAME}»!\n"
+                            "Пожалуйста, оцените качество обслуживания:"
+                        )
+                    else:
+                        expire_text = (
                             f"⏱ <b>Muloqot vaqti (1 soat) yakunlandi.</b>\n\n"
                             f"«{config.COMPANY_NAME}» xizmatlaridan foydalanganingiz uchun tashakkur!\n"
                             f"{config.RATING_PROMPT}"
-                        ),
+                        )
+                    await bot.send_message(
+                        chat_id=cust_id,
+                        text=expire_text,
                         reply_markup=get_customer_rating_keyboard(ticket_id),
                         parse_mode="HTML"
                     )
@@ -101,7 +110,33 @@ async def main():
     dp.include_router(client_router)
     dp.include_router(relay_router)
 
-    # 4. Avtomatik 1 soatlik taymer vazifasini ishga tushirish
+    # 4. Telegram Menu tugmasiga buyruqlarni o'rnatish
+    from aiogram.types import BotCommand, BotCommandScopeDefault, BotCommandScopeChat
+    try:
+        await bot.set_my_commands(
+            commands=[
+                BotCommand(command="start", description="🚀 Boshlash / Старт"),
+                BotCommand(command="lang", description="🌐 Tilni tanlash / Выбор языка"),
+            ],
+            scope=BotCommandScopeDefault()
+        )
+        for admin_id in config.ADMIN_IDS:
+            try:
+                await bot.set_my_commands(
+                    commands=[
+                        BotCommand(command="start", description="🚀 Asosiy menyu"),
+                        BotCommand(command="admin", description="👑 Admin paneli"),
+                        BotCommand(command="operator", description="🎧 Operator rejimi"),
+                    ],
+                    scope=BotCommandScopeChat(chat_id=admin_id)
+                )
+            except Exception:
+                pass
+        logger.info("Telegram Menu buyruqlari muvaffaqiyatli o'rnatildi.")
+    except Exception as e:
+        logger.warning(f"Menu buyruqlarini o'rnatishda xatolik: {e}")
+
+    # 5. Avtomatik 1 soatlik taymer vazifasini ishga tushirish
     asyncio.create_task(auto_close_sessions_loop(bot))
 
     logger.info(f"«{config.COMPANY_NAME}» Call Center Bot ishga tushmoqda...")

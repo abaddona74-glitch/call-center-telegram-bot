@@ -65,7 +65,15 @@ async def relay_messages(message: Message, bot: Bot):
             pass
         try:
             # Xabarni mijozga aynan qanday bo'lsa shunday nusxalab yuboramiz
-            await message.copy_to(chat_id=customer_id)
+            sent_cust_msg = await message.copy_to(chat_id=customer_id)
+            if sent_cust_msg:
+                await db.save_relayed_message(
+                    session_id=sess_id,
+                    source_chat_id=user_id,
+                    source_message_id=message.message_id,
+                    target_chat_id=customer_id,
+                    target_message_id=sent_cust_msg.message_id
+                )
         except TelegramAPIError as e:
             await message.answer(f"⚠️ Xabarni mijozga yetkazishda xatolik yuz berdi: {e}")
         return
@@ -88,18 +96,20 @@ async def relay_messages(message: Message, bot: Bot):
         except Exception:
             pass
         try:
-            # Xabarni operatorga uzatamiz:
-            # Avval forward qilib ko'ramiz (shunda operator mijoz profilini bosib ko'ra oladi):
-            sent_op_msg = None
-            try:
-                sent_op_msg = await message.forward(chat_id=operator_id)
-            except TelegramAPIError:
-                # Agar mijoz o'z profilida forwardni yashirgan bo'lsa, copy_to orqali yetkazamiz
-                sent_op_msg = await message.copy_to(chat_id=operator_id)
+            # Xabarni operatorga copy_to orqali yetkazamiz (shunda bot tomonidan yuborilib, edit qilinganda o'zgaradi)
+            sent_op_msg = await message.copy_to(chat_id=operator_id)
             
             if sent_op_msg:
                 # Operator chatidan o'chirish uchun xabarni saqlaymiz
                 await db.track_session_message(sess_id, operator_id, sent_op_msg.message_id)
+                # Tahrirlash (edited_message) uchun bog'lanishni saqlaymiz
+                await db.save_relayed_message(
+                    session_id=sess_id,
+                    source_chat_id=user_id,
+                    source_message_id=message.message_id,
+                    target_chat_id=operator_id,
+                    target_message_id=sent_op_msg.message_id
+                )
         except TelegramAPIError as e:
             await message.answer(f"⚠️ Xabarni operatorga yetkazishda xatolik: {e}")
         return
@@ -119,3 +129,44 @@ async def relay_messages(message: Message, bot: Bot):
         "Operator bilan bog'lanish uchun /start buyrug'ini bosing.",
         parse_mode="HTML"
     )
+
+
+# ================= TAHRIRLANGAN XABARLARNI SINXRONLASHTIRISH =================
+
+@router.edited_message()
+async def handle_edited_messages(message: Message, bot: Bot):
+    """
+    Operator yoki mijoz o'z xabarini tahrirlaganda (edit qilganda),
+    ikkinchi tomonga yetkazilgan xabarni ham avtomatik tarzda real vaqtda tahrirlash.
+    """
+    user_id = message.from_user.id
+    relayed = await db.get_relayed_message(user_id, message.message_id)
+    if not relayed:
+        return
+
+    sess_id = relayed["session_id"]
+    target_chat_id = relayed["target_chat_id"]
+    target_message_id = relayed["target_message_id"]
+
+    # Sessiya faol ekanligini tekshiramiz
+    sess = await db.get_session_by_id(sess_id)
+    if not sess or sess.get("status") != "active":
+        return
+
+    try:
+        if message.text:
+            await bot.edit_message_text(
+                chat_id=target_chat_id,
+                message_id=target_message_id,
+                text=message.text,
+                entities=message.entities
+            )
+        elif message.caption is not None:
+            await bot.edit_message_caption(
+                chat_id=target_chat_id,
+                message_id=target_message_id,
+                caption=message.caption,
+                caption_entities=message.caption_entities
+            )
+    except TelegramAPIError:
+        pass

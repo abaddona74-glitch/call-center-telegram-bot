@@ -17,7 +17,8 @@ from keyboards import (
 from handlers.common import (
     update_ticket_notifications_as_claimed, 
     broadcast_new_ticket_to_operators,
-    clean_up_operator_session_messages
+    clean_up_operator_session_messages,
+    format_topic_line
 )
 
 router = Router()
@@ -461,6 +462,12 @@ async def op_accept_ticket(callback: CallbackQuery, bot: Bot):
 
     await callback.answer("Mijoz qabul qilindi!")
 
+    first_msg = ticket.get("first_message", "")
+    topic_line = format_topic_line(first_msg)
+
+    customer_lang = await db.get_user_language(customer_id)
+    lang_badge = "🇷🇺 Ruscha" if customer_lang == "ru" else "🇺🇿 O'zbekcha"
+
     # 1. Boshqa operatorlardagi tugmani yangilash
     await update_ticket_notifications_as_claimed(bot, ticket_id, op_name, operator_id)
 
@@ -470,7 +477,9 @@ async def op_accept_ticket(callback: CallbackQuery, bot: Bot):
             f"✅ <b>Mijoz #{ticket_id} qabul qilindi!</b>\n\n"
             f"👤 <b>Mijoz:</b> {user_link}\n"
             f"📱 <b>Telegram:</b> {username_text}\n"
-            f"🆔 <b>Telegram ID:</b> <code>{customer_id}</code>\n\n"
+            f"🆔 <b>Telegram ID:</b> <code>{customer_id}</code>\n"
+            f"🌐 <b>Muloqot tili:</b> {lang_badge}\n"
+            f"{topic_line}\n"
             f"<i>Endi siz yozgan barcha xabarlar to'g'ridan-to'g'ri mijozga yetkaziladi.</i>",
             parse_mode="HTML"
         )
@@ -497,7 +506,9 @@ async def op_accept_ticket(callback: CallbackQuery, bot: Bot):
             f"💬 <b>{user_link} bilan muloqot boshlandi!</b>\n\n"
             f"👤 <b>Ism:</b> {customer_name}\n"
             f"📱 <b>Username:</b> {username_text}\n"
-            f"🆔 <b>Telegram ID:</b> <code>{customer_id}</code>\n\n"
+            f"🆔 <b>Telegram ID:</b> <code>{customer_id}</code>\n"
+            f"🌐 <b>Muloqot tili:</b> {lang_badge}\n"
+            f"{topic_line}\n"
             f"<i>(Suhbatni yakunlash uchun pastdagi <b>«🛑 Suhbatni yakunlash»</b> tugmasini bosing)</i>"
         ),
         reply_markup=get_operator_active_keyboard(),
@@ -519,16 +530,47 @@ async def op_accept_ticket(callback: CallbackQuery, bot: Bot):
         except Exception:
             pass
 
-    # 3. Mijozga salomlashuv shabloni va faol klaviatura yuborish
-    greeting_text = config.GREETING_TEMPLATE.format(
-        company_name=config.COMPANY_NAME,
-        operator_name=op_name
+    # Bot tomonidan operatorga yo'nalish eslatmasi (Mijoz xabari emasligini alohida ta'kidlash)
+    clean_topic = "Umumiy murojaat"
+    if first_msg:
+        if first_msg.startswith("[Yo'nalish:"):
+            clean_topic = first_msg.replace("[Yo'nalish:", "").rstrip("]").strip()
+        else:
+            clean_topic = first_msg
+
+    bot_reminder_text = (
+        "🤖 <b>[BOT ESLATMASI]:</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📌 <b>Mijoz murojaat qilgan masala:</b>\n"
+        f"👉 <b>{clean_topic}</b>\n\n"
+        f"🌐 <b>Muloqot tili:</b> {lang_badge}\n\n"
+        "💡 <i>(Diqqat: Bu xabar bot tomonidan avtomatik yuborildi. Bu mijozning shaxsiy xabari emas, mijoz aynan shu bo'lim/masala bo'yicha operatorga ulangan)</i>"
     )
+
+    reminder_msg = await bot.send_message(
+        chat_id=operator_id,
+        text=bot_reminder_text,
+        parse_mode="HTML"
+    )
+    if sess_id and reminder_msg:
+        await db.track_session_message(sess_id, operator_id, reminder_msg.message_id)
+
+    # 3. Mijozga salomlashuv shabloni va faol klaviatura yuborish
+    if customer_lang == "ru":
+        greeting_text = (
+            f"✅ Оператор <b>{op_name}</b> подключился к диалогу!\n\n"
+            "Вы можете написать свой вопрос, оператор сейчас ответит вам."
+        )
+    else:
+        greeting_text = config.GREETING_TEMPLATE.format(
+            company_name=config.COMPANY_NAME,
+            operator_name=op_name
+        )
 
     await bot.send_message(
         chat_id=customer_id,
         text=greeting_text,
-        reply_markup=get_customer_active_keyboard(),
+        reply_markup=get_customer_active_keyboard(customer_lang),
         parse_mode="HTML"
     )
 
@@ -577,10 +619,17 @@ async def op_end_chat(message: Message, bot: Bot):
     )
 
     # Mijozga xayrlashuv va yulduzli baholash tugmalari
-    farewell_text = (
-        f"{config.FAREWELL_TEMPLATE.format(company_name=config.COMPANY_NAME)}\n\n"
-        f"{config.RATING_PROMPT}"
-    )
+    customer_lang = await db.get_user_language(customer_id)
+    if customer_lang == "ru":
+        farewell_text = (
+            "ℹ️ <b>Оператор завершил диалог.</b> Спасибо за обращение!\n\n"
+            "Пожалуйста, оцените качество обслуживания:"
+        )
+    else:
+        farewell_text = (
+            f"{config.FAREWELL_TEMPLATE.format(company_name=config.COMPANY_NAME)}\n\n"
+            f"{config.RATING_PROMPT}"
+        )
 
     try:
         await bot.send_message(
@@ -622,10 +671,11 @@ async def build_op_history_list_text(sessions: list, total: int, page: int, op_n
     for i, s in enumerate(sessions, start_num):
         rating_str = f"{s['rating']} ⭐" if s.get("rating") else "—"
         date_str = s["closed_at"].split()[0] if s.get("closed_at") and " " in s["closed_at"] else (s.get("closed_at") or "")
+        reason_info = f"\n  💬 <b>Fikr:</b> <i>{s['feedback_reason']}</i>" if s.get("feedback_reason") else ""
         text += (
             f"<b>{i}. Ticket #{s['ticket_id']}</b>\n"
             f"  👤 Mijoz: {s['customer_name']}\n"
-            f"  📅 {date_str} | ⭐ {rating_str}\n"
+            f"  📅 {date_str} | ⭐ {rating_str}{reason_info}\n"
             "──────────────────────\n"
         )
     return text
@@ -688,6 +738,8 @@ async def cb_op_history_view(callback: CallbackQuery):
     messages = await db.get_session_messages(session_id)
 
     rating_str = f"{session['rating']} ⭐" if session.get("rating") else "Baholanmagan"
+    if session.get("feedback_reason"):
+        rating_str += f" (E'tiroz: <i>{session['feedback_reason']}</i>)"
     started = session.get("started_at", "")
     closed = session.get("closed_at", "")
 

@@ -14,7 +14,8 @@ from keyboards import (
     get_admin_operator_card_keyboard,
     get_admin_operators_kick_keyboard,
     get_history_sessions_keyboard,
-    get_history_back_keyboard
+    get_history_back_keyboard,
+    get_admin_history_operators_keyboard
 )
 
 router = Router()
@@ -25,6 +26,10 @@ HISTORY_PER_PAGE = 10
 class AdminEditOperatorState(StatesGroup):
     waiting_for_name = State()
     waiting_for_code = State()
+
+
+class AdminHistorySearchState(StatesGroup):
+    waiting_for_query = State()
 
 
 def is_admin(user_id: int) -> bool:
@@ -607,14 +612,30 @@ async def cb_admin_refresh(callback: CallbackQuery):
 
 # ================= 7. SUHBATLAR TARIXI (CHAT HISTORY) =================
 
-async def build_history_list_text(sessions: list, total: int, page: int) -> str:
+async def build_history_list_text(
+    sessions: list, total: int, page: int, operator_info: Optional[Dict[str, Any]] = None
+) -> str:
+    op_header = ""
+    if operator_info:
+        code_str = f" [#{operator_info['operator_code']}]" if operator_info.get("operator_code") else ""
+        op_header = f"👨‍💼 <b>Operator:</b> {operator_info['full_name']}{code_str}\n"
+
     if not sessions:
+        if operator_info:
+            return (
+                f"📜 <b>Suhbatlar tarixi</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"{op_header}"
+                "<i>Ushbu operator tomonidan hozircha yakunlangan suhbatlar mavjud emas.</i>"
+            )
         return "📜 <b>Hozircha hech qanday yakunlangan suhbat mavjud emas.</b>"
 
     start_num = page * HISTORY_PER_PAGE + 1
+    title = f"📜 <b>Suhbatlar tarixi ({total} ta)</b>\n"
     text = (
-        f"📜 <b>Suhbatlar tarixi ({total} ta)</b>\n"
+        f"{title}"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{op_header}"
         "<i>Suhbat tarixini ko'rish uchun quyidagi tugmalardan birini tanlang:</i>\n\n"
     )
     for i, s in enumerate(sessions, start_num):
@@ -622,24 +643,26 @@ async def build_history_list_text(sessions: list, total: int, page: int) -> str:
         op_name = s.get("operator_name", "Noma'lum")
         op_code = f" [#{s['operator_code']}]" if s.get("operator_code") else ""
         date_str = s["closed_at"].split()[0] if s.get("closed_at") and " " in s["closed_at"] else (s.get("closed_at") or "")
+        reason_info = f"\n  💬 <b>Fikr:</b> <i>{s['feedback_reason']}</i>" if s.get("feedback_reason") else ""
         text += (
             f"<b>{i}. Ticket #{s['ticket_id']}</b>\n"
             f"  👤 Mijoz: {s['customer_name']}\n"
             f"  👨‍💼 Operator: {op_name}{op_code}\n"
-            f"  📅 Sana: {date_str} | ⭐ {rating_str}\n"
+            f"  📅 Sana: {date_str} | ⭐ {rating_str}{reason_info}\n"
             "──────────────────────\n"
         )
     return text
 
 
 @router.message(F.text == "📜 Suhbatlar tarixi")
-async def admin_chat_history(message: Message):
+async def admin_chat_history(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
+    await state.clear()
 
-    sessions, total = await db.get_closed_sessions_list(limit=HISTORY_PER_PAGE, offset=0)
+    sessions, total = await db.get_closed_sessions_list(limit=HISTORY_PER_PAGE, offset=0, operator_id=None)
     text = await build_history_list_text(sessions, total, 0)
-    kb = get_history_sessions_keyboard(sessions, 0, total, HISTORY_PER_PAGE, "admin")
+    kb = get_history_sessions_keyboard(sessions, 0, total, HISTORY_PER_PAGE, "admin", operator_id=0)
     await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
 
@@ -649,11 +672,20 @@ async def cb_admin_history_page(callback: CallbackQuery):
         await callback.answer("Ruxsat yo'q!", show_alert=True)
         return
 
-    page = int(callback.data.split(":")[1])
+    parts = callback.data.split(":")
+    page = int(parts[1]) if len(parts) > 1 else 0
+    operator_id = int(parts[2]) if len(parts) > 2 else 0
     offset = page * HISTORY_PER_PAGE
-    sessions, total = await db.get_closed_sessions_list(limit=HISTORY_PER_PAGE, offset=offset)
-    text = await build_history_list_text(sessions, total, page)
-    kb = get_history_sessions_keyboard(sessions, page, total, HISTORY_PER_PAGE, "admin")
+
+    operator_info = None
+    if operator_id > 0:
+        operator_info = await db.get_operator(operator_id)
+        sessions, total = await db.get_closed_sessions_list(limit=HISTORY_PER_PAGE, offset=offset, operator_id=operator_id)
+    else:
+        sessions, total = await db.get_closed_sessions_list(limit=HISTORY_PER_PAGE, offset=offset, operator_id=None)
+
+    text = await build_history_list_text(sessions, total, page, operator_info=operator_info)
+    kb = get_history_sessions_keyboard(sessions, page, total, HISTORY_PER_PAGE, "admin", operator_id=operator_id)
 
     try:
         await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
@@ -662,13 +694,91 @@ async def cb_admin_history_page(callback: CallbackQuery):
         await callback.answer("Ma'lumotlar o'zgarmagan.")
 
 
+@router.callback_query(F.data == "admin_history_ops")
+async def cb_admin_history_ops(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q!", show_alert=True)
+        return
+
+    ops = await db.get_operators_history_stats()
+    if not ops:
+        await callback.answer("Operatorlar mavjud emas!", show_alert=True)
+        return
+
+    text = (
+        "👨‍💼 <b>Suhbatlar tarixini ko'rish uchun operatorni tanlang:</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "<i>Har bir operator yonida u yakunlagan jami suhbatlar soni ko'rsatilgan:</i>"
+    )
+    kb = get_admin_history_operators_keyboard(ops)
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        await callback.answer()
+    except Exception:
+        await callback.answer()
+
+
+@router.callback_query(F.data == "admin_history_search")
+async def cb_admin_history_search(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q!", show_alert=True)
+        return
+
+    await state.set_state(AdminHistorySearchState.waiting_for_query)
+    await callback.message.answer(
+        "🔍 Qidirmoqchi bo'lgan operatorning <b>ismi</b> yoki <b>ID raqami</b>ni kiriting:\n"
+        "<i>(Masalan: Mahmudbek yoki 101)</i>",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.message(AdminHistorySearchState.waiting_for_query)
+async def process_admin_history_search(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+
+    query = (message.text or "").strip()
+    await state.clear()
+
+    if not query:
+        await message.answer("Qidiruv bekor qilindi.")
+        return
+
+    results = await db.search_operators(query)
+    if not results:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔍 Qayta qidirish", callback_data="admin_history_search")],
+            [InlineKeyboardButton(text="👥 Barcha operatorlar", callback_data="admin_history_ops")],
+            [InlineKeyboardButton(text="📜 Barcha suhbatlar", callback_data="admin_history_page:0:0")]
+        ])
+        await message.answer(
+            f"🔍 «<b>{query}</b>» bo'yicha hech qanday operator topilmadi.",
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+        return
+
+    text = (
+        f"🔍 «<b>{query}</b>» bo'yicha topilgan operatorlar:\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "<i>Suhbatlarini ko'rish uchun kerakli operatorni tanlang:</i>"
+    )
+    kb = get_admin_history_operators_keyboard(results)
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
 @router.callback_query(F.data.startswith("admin_history_view:"))
 async def cb_admin_history_view(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer("Ruxsat yo'q!", show_alert=True)
         return
 
-    session_id = int(callback.data.split(":")[1])
+    parts = callback.data.split(":")
+    session_id = int(parts[1])
+    page = int(parts[2]) if len(parts) > 2 else 0
+    operator_id = int(parts[3]) if len(parts) > 3 else 0
+
     session = await db.get_session_by_id(session_id)
     if not session:
         await callback.answer("Suhbat topilmadi!", show_alert=True)
@@ -678,6 +788,8 @@ async def cb_admin_history_view(callback: CallbackQuery):
 
     # Suhbat ma'lumotlari
     rating_str = f"{session['rating']} ⭐" if session.get("rating") else "Baholanmagan"
+    if session.get("feedback_reason"):
+        rating_str += f" (E'tiroz: <i>{session['feedback_reason']}</i>)"
     op_name = session.get("operator_name") or "Noma'lum"
     op_code = f" [#{session['operator_code']}]" if session.get("operator_code") else ""
     started = session.get("started_at", "")
@@ -723,7 +835,7 @@ async def cb_admin_history_view(callback: CallbackQuery):
         text = text[:3950] + "\n\n<i>... (xabarlar juda ko'p, qisqartirildi)</i>"
 
     media_files = await db.get_session_media_messages(session_id)
-    kb = get_history_back_keyboard(0, "admin", session_id=session_id, media_count=len(media_files))
+    kb = get_history_back_keyboard(page, "admin", session_id=session_id, media_count=len(media_files), operator_id=operator_id)
     try:
         await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
         await callback.answer()

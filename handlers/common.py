@@ -4,6 +4,16 @@ import database as db
 from keyboards import get_accept_ticket_keyboard, get_ticket_claimed_keyboard
 
 
+def format_topic_line(first_msg: str) -> str:
+    """Mijoz tanlagan bo'lim/yo'nalish yoki dastlabki xabarni chiroyli formatlash"""
+    if not first_msg:
+        return ""
+    if first_msg.startswith("[Yo'nalish:"):
+        clean_topic = first_msg.replace("[Yo'nalish:", "").rstrip("]").strip()
+        return f"📂 <b>Tanlangan bo'lim:</b> <b>{clean_topic}</b>\n"
+    return f"💬 <b>Dastlabki xabar:</b> <i>{first_msg}</i>\n"
+
+
 async def broadcast_new_ticket_to_operators(
     bot: Bot, 
     ticket_id: int, 
@@ -27,15 +37,18 @@ async def broadcast_new_ticket_to_operators(
 
     user_link = f'<a href="tg://user?id={customer_id}">{customer_name}</a>' if customer_id else customer_name
     username_text = f"@{customer_username}" if customer_username else "<i>(Mavjud emas)</i>"
+    topic_line = format_topic_line(first_message)
+    customer_lang = await db.get_user_language(customer_id)
+    lang_badge = "🇷🇺 Ruscha" if customer_lang == "ru" else "🇺🇿 O'zbekcha"
 
     text = (
         f"🔔 <b>Yangi murojaat: Mijoz #{ticket_id}</b>\n\n"
         f"👤 <b>Mijoz:</b> {user_link}\n"
         f"📱 <b>Telegram:</b> {username_text}\n"
         f"🆔 <b>Telegram ID:</b> <code>{customer_id}</code>\n"
+        f"🌐 <b>Muloqot tili:</b> {lang_badge}\n"
+        f"{topic_line}"
     )
-    if first_message:
-        text += f"💬 <b>Dastlabki xabar:</b> <i>{first_message}</i>\n"
 
     kb = get_accept_ticket_keyboard(ticket_id, customer_username=customer_username)
 
@@ -70,15 +83,15 @@ async def update_ticket_notifications_as_claimed(
 
     user_link = f'<a href="tg://user?id={customer_id}">{customer_name}</a>' if customer_id else customer_name
     username_text = f" (@{customer_username})" if customer_username else ""
+    topic_line = format_topic_line(first_msg)
 
     text = (
         f"🔔 <b>Murojaat: Mijoz #{ticket_id}</b>\n\n"
         f"👤 <b>Mijoz:</b> {user_link}{username_text}\n"
         f"🆔 <b>Telegram ID:</b> <code>{customer_id}</code>\n"
+        f"{topic_line}\n"
+        f"✅ <b>{operator_name} qabul qildi</b>"
     )
-    if first_msg:
-        text += f"💬 <b>Dastlabki xabar:</b> <i>{first_msg}</i>\n"
-    text += f"\n✅ <b>{operator_name} qabul qildi</b>"
 
     notifications = await db.get_notifications(ticket_id)
     for notif in notifications:

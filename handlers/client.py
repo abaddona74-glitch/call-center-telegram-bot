@@ -1,26 +1,39 @@
 from aiogram import Router, F, Bot
-from aiogram.types import Message, CallbackQuery, ReplyKeyboardRemove
+from aiogram.types import Message, CallbackQuery, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 import aiosqlite
+import re
+import os
 
 import database as db
 import config
 from regions import CONTRACT_REGIONS
+from locales import t, get_reason_text
+
+BANNER_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets", "banner.jpg")
 from keyboards import (
+    get_language_selection_keyboard,
     get_customer_main_menu_keyboard,
     get_regions_keyboard,
     get_region_details_keyboard,
     get_customer_queue_keyboard,
+    get_customer_active_keyboard,
     get_customer_rating_keyboard,
+    get_negative_feedback_keyboard,
     get_operator_idle_keyboard
 )
-from handlers.common import broadcast_new_ticket_to_operators
+from handlers.common import broadcast_new_ticket_to_operators, clean_up_operator_session_messages
 
 router = Router()
 
 
-def _format_eta_text(eta: dict, subject: str = "") -> str:
+class CustomerFeedbackState(StatesGroup):
+    waiting_for_reason = State()
+
+
+def _format_eta_text(eta: dict, subject: str = "", lang: str = "uz") -> str:
     ticket_id = eta["ticket_id"]
     ahead = eta["ahead_count"]
     online = eta["online_operators"]
@@ -28,28 +41,20 @@ def _format_eta_text(eta: dict, subject: str = "") -> str:
     est_min = eta["est_minutes"]
     est_max = eta["est_max"]
 
-    subj_str = f"<b>{subject}</b> bo'yicha " if subject else ""
-    text = f"⏳ Sizning {subj_str}murojaatingiz qabul qilindi (Ticket #{ticket_id}).\n\n"
+    if lang == "ru":
+        subj_str = f" по <b>{subject}</b>" if subject else ""
+    else:
+        subj_str = f"<b>{subject}</b> bo'yicha " if subject else ""
+
+    text = t("queue_accepted", lang, subj=subj_str)
 
     if online == 0:
-        text += (
-            "🔴 <b>Hozirda barcha operatorlarimiz tanaffusda.</b>\n"
-            "Murojaatingiz navbatga yozildi. Operatorlarimiz ishga qaytishi bilanoq sizga ulanamiz.\n\n"
-            "<i>Iltimos, kuting...</i>"
-        )
+        text += t("queue_all_offline", lang)
     elif ahead == 0 and avail > 0:
-        text += (
-            "🟢 <b>Bo'sh operatorimiz hozir sizga ulanmoqda!</b>\n"
-            "<i>Iltimos, bir necha soniya kuting...</i>"
-        )
+        text += t("queue_routed", lang)
     else:
-        ahead_text = f"👥 <b>Sizdan oldingi murojaatlar:</b> {ahead} ta\n" if ahead > 0 else ""
-        text += (
-            "🟡 <b>Hozirda barcha operatorlarimiz mijozlar bilan muloqotda.</b>\n"
-            f"⏱ <b>Taxminiy kutish vaqti:</b> ~{est_min}–{est_max} daqiqa\n"
-            f"{ahead_text}\n"
-            "<i>Operatorimiz bo'shashi bilan darhol sizga ulanadi, iltimos kuting...</i>"
-        )
+        ahead_text = (t("queue_ahead_count", lang, ahead=ahead) + "\n") if ahead > 0 else ""
+        text += t("queue_busy", lang, est_min=est_min, est_max=est_max, ahead_text=ahead_text)
     return text
 
 
@@ -94,12 +99,14 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext):
         )
         return
 
+    lang = await db.get_user_language(user_id)
+
     # 3. Agar foydalanuvchi hozir faol suhbatda bo'lsa
     active_sess = await db.get_active_session_by_customer(user_id)
     if active_sess:
         await message.answer(
-            f"Siz hozirda operator <b>{active_sess['operator_name']}</b> bilan muloqotdasiz.\n"
-            "Savollaringizni to'g'ridan-to'g'ri yozishingiz mumkin.",
+            t("in_active_chat", lang, operator_name=active_sess['operator_name']),
+            reply_markup=get_customer_active_keyboard(lang),
             parse_mode="HTML"
         )
         return
@@ -112,37 +119,74 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext):
         avail = eta["available_operators"]
         est_min = eta["est_minutes"]
         est_max = eta["est_max"]
+
         if online == 0:
-            status_desc = "🔴 Hozirda operatorlar tanaffusda, tez orada ulanamiz."
+            status_desc = t("queue_all_offline", lang)
         elif ahead == 0 and avail > 0:
-            status_desc = "🟢 Bo'sh operator hozir sizga ulanmoqda!"
+            status_desc = t("queue_routed", lang)
         else:
-            ahead_text = f"\n👥 <b>Sizdan oldingi murojaatlar:</b> {ahead} ta" if ahead > 0 else ""
-            status_desc = (
-                "🟡 <b>Hozirda barcha operatorlarimiz mijozlar bilan muloqotda.</b>\n"
-                f"⏱ <b>Taxminiy kutish vaqti:</b> ~{est_min}–{est_max} daqiqa{ahead_text}"
-            )
+            ahead_text = (t("queue_ahead_count", lang, ahead=ahead) + "\n") if ahead > 0 else ""
+            status_desc = t("queue_busy", lang, est_min=est_min, est_max=est_max, ahead_text=ahead_text)
 
         await message.answer(
-            f"📍 <b>Murojaatingiz holati (Ticket #{eta['ticket_id']}):</b>\n\n"
-            f"{status_desc}\n\n"
-            "<i>Iltimos, operator bog'lanishini kuting.</i>",
-            reply_markup=get_customer_queue_keyboard(),
+            t("queue_status_title", lang, status_desc=status_desc),
+            reply_markup=get_customer_queue_keyboard(lang),
             parse_mode="HTML"
         )
         return
 
-    # 5. Yangi mijozga asosiy xizmatlar menyusini ko'rsatish
-    welcome_text = (
-        f"👋 <b>Assalomu alaykum, {user_name}!</b>\n\n"
-        f"«{config.COMPANY_NAME}» yagona aloqa markaziga xush kelibsiz.\n\n"
-        "Sizga qanday yordam bera olamiz? Iltimos, kerakli bo'limni tanlang:"
+    # 5. Har qanday mijoz uchun /start bosilganda birinchi navbatda til tanlashni ko'rsatamiz:
+    await message.answer(
+        t("choose_lang"),
+        reply_markup=get_language_selection_keyboard()
     )
 
-    await message.answer(
+
+# ================= TIL TANLASH (LANGUAGE SELECTION) =================
+
+@router.callback_query(F.data.startswith("set_lang:"))
+async def cb_set_language(callback: CallbackQuery):
+    lang = callback.data.split(":")[1]
+    user_id = callback.from_user.id
+    user_name = callback.from_user.full_name or "Mijoz"
+
+    await db.set_user_language(user_id, lang)
+    await callback.answer(t("lang_selected", lang))
+
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+    welcome_text = t("welcome_caption", lang, name=user_name, company=config.COMPANY_NAME)
+
+    if os.path.exists(BANNER_PATH):
+        try:
+            banner_file = FSInputFile(BANNER_PATH)
+            await callback.message.answer_photo(
+                photo=banner_file,
+                caption=welcome_text,
+                reply_markup=get_customer_main_menu_keyboard(lang),
+                parse_mode="HTML"
+            )
+            return
+        except Exception:
+            pass
+
+    await callback.message.answer(
         welcome_text,
-        reply_markup=get_customer_main_menu_keyboard(),
+        reply_markup=get_customer_main_menu_keyboard(lang),
         parse_mode="HTML"
+    )
+
+
+@router.message(F.text.in_({"🌐 Tilni o'zgartirish", "🌐 Сменить язык", "🌐 Tilni tanlash"}))
+@router.message(Command("lang"))
+@router.message(Command("language"))
+async def cmd_change_language(message: Message):
+    await message.answer(
+        t("choose_lang"),
+        reply_markup=get_language_selection_keyboard()
     )
 
 
@@ -152,13 +196,14 @@ async def _connect_customer_to_queue(message: Message, bot: Bot, subject: str):
     """Mijozni ma'lum bir mavzu bo'yicha operator navbatiga qo'shish"""
     user_id = message.from_user.id
     user_name = message.from_user.full_name or "Mijoz"
+    lang = await db.get_user_language(user_id)
 
     # Faol suhbatda bo'lsa
     active_sess = await db.get_active_session_by_customer(user_id)
     if active_sess:
         await message.answer(
-            f"Siz hozirda operator <b>{active_sess['operator_name']}</b> bilan muloqotdasiz.\n"
-            "Savollaringizni to'g'ridan-to'g'ri yozishingiz mumkin.",
+            t("in_active_chat", lang, operator_name=active_sess['operator_name']),
+            reply_markup=get_customer_active_keyboard(lang),
             parse_mode="HTML"
         )
         return
@@ -170,10 +215,8 @@ async def _connect_customer_to_queue(message: Message, bot: Bot, subject: str):
         est_min = eta["est_minutes"]
         est_max = eta["est_max"]
         await message.answer(
-            f"📍 Siz allaqachon navbatdasiz (Ticket #{eta['ticket_id']}).\n"
-            f"⏱ <b>Taxminiy kutish vaqti:</b> ~{est_min}–{est_max} daqiqa (oldinda {ahead} ta murojaat).\n\n"
-            "Iltimos, operator bog'lanishini kuting.",
-            reply_markup=get_customer_queue_keyboard(),
+            t("queue_already_waiting", lang, est_min=est_min, est_max=est_max, ahead=ahead),
+            reply_markup=get_customer_queue_keyboard(lang),
             parse_mode="HTML"
         )
         return
@@ -188,11 +231,11 @@ async def _connect_customer_to_queue(message: Message, bot: Bot, subject: str):
         customer_username=customer_username
     )
     eta = await db.get_queue_eta_info(user_id)
-    welcome_text = _format_eta_text(eta, subject)
+    welcome_text = _format_eta_text(eta, subject, lang=lang)
 
     await message.answer(
         welcome_text,
-        reply_markup=get_customer_queue_keyboard(),
+        reply_markup=get_customer_queue_keyboard(lang),
         parse_mode="HTML"
     )
 
@@ -207,28 +250,23 @@ async def _connect_customer_to_queue(message: Message, bot: Bot, subject: str):
     )
 
 
-
 # ================= YO'NALISHLAR (BUTTON HANDLERS) =================
 
-@router.message(F.text == "⚖️ e-Huquqshunos")
+@router.message(F.text.in_({"e-huquqshunos", "⚖️ e-huquqshunos", "⚖️ e-Huquqshunos"}))
 async def handle_e_huquqshunos(message: Message, bot: Bot):
-    await _connect_customer_to_queue(message, bot, "⚖️ e-Huquqshunos")
+    await _connect_customer_to_queue(message, bot, "e-huquqshunos")
 
 
-@router.message(F.text == "📄 edo.ijro.uz")
+@router.message(F.text.in_({"edo.ijro.uz", "📄 edo.ijro.uz"}))
 async def handle_edo_ijro(message: Message, bot: Bot):
-    await _connect_customer_to_queue(message, bot, "📄 edo.ijro.uz")
+    await _connect_customer_to_queue(message, bot, "edo.ijro.uz")
 
 
-@router.message(F.text == "📝 Shartnoma masalasida")
+@router.message(F.text.in_({"Shartnoma masalasida", "📝 Shartnoma masalasida", "По вопросам договоров", "📝 По вопросам договоров"}))
 async def handle_contract_issues(message: Message):
-    text = (
-        "📝 <b>Shartnoma masalasida</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Iltimos, shartnoma bo'yicha bog'lanmoqchi bo'lgan <b>hududingizni (viloyat yoki shahar)</b> tanlang:\n\n"
-        "<i>Tegishli mutaxassislar bilan to'g'ridan-to'g'ri aloqa ma'lumotlari beriladi.</i>"
-    )
-    await message.answer(text, reply_markup=get_regions_keyboard(), parse_mode="HTML")
+    lang = await db.get_user_language(message.from_user.id)
+    text = t("regions_title", lang)
+    await message.answer(text, reply_markup=get_regions_keyboard(lang), parse_mode="HTML")
 
 
 # ================= VILOYATLAR VA SHARTNOMA INLINE CALLBACKLARI =================
@@ -237,31 +275,36 @@ async def handle_contract_issues(message: Message):
 async def cb_region_selected(callback: CallbackQuery):
     region_key = callback.data.split(":")[1]
     reg = CONTRACT_REGIONS.get(region_key)
+    lang = await db.get_user_language(callback.from_user.id)
+
     if not reg:
-        await callback.answer("Hudud ma'lumotlari topilmadi!", show_alert=True)
+        alert_msg = "Регион не найден!" if lang == "ru" else "Hudud ma'lumotlari topilmadi!"
+        await callback.answer(alert_msg, show_alert=True)
         return
 
-    text = (
-        f"📝 <b>Shartnoma masalasida — {reg['name']}</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Tegishli mas'ul mutaxassislar bilan bog'lanish uchun:\n\n"
-        "📞 <b>Aloqa telefonlari:</b>\n"
-    )
+    region_name = reg.get("name_ru") if lang == "ru" else reg.get("name")
+
+    phones_text = ""
     for p in reg["phones"]:
-        text += f"• <code>{p}</code>\n"
+        clean_p = re.sub(r"[^\d+]", "", p)
+        phones_text += f'• 📞 <a href="tel:{clean_p}"><b>{p}</b></a>\n'
 
+    tg_text = ""
     if reg.get("telegram"):
-        text += f"\n💬 <b>Telegram:</b> {reg['telegram']}\n"
+        tg_text = t("tg_label", lang, tg=reg['telegram'])
 
-    text += (
-        "\n──────────────────────\n"
-        "<i>💡 Shuningdek, kerak bo'lsa operator bilan ham bog'lanishingiz mumkin.</i>"
+    card_text = t(
+        "region_card",
+        lang,
+        region_name=region_name,
+        phones=phones_text.strip(),
+        tg_text=tg_text
     )
 
     try:
         await callback.message.edit_text(
-            text,
-            reply_markup=get_region_details_keyboard(region_key),
+            card_text,
+            reply_markup=get_region_details_keyboard(region_key, lang=lang),
             parse_mode="HTML"
         )
         await callback.answer()
@@ -271,13 +314,10 @@ async def cb_region_selected(callback: CallbackQuery):
 
 @router.callback_query(F.data == "regions_list")
 async def cb_regions_list(callback: CallbackQuery):
-    text = (
-        "📝 <b>Shartnoma masalasida</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Iltimos, shartnoma bo'yicha bog'lanmoqchi bo'lgan <b>hududingizni (viloyat yoki shahar)</b> tanlang:"
-    )
+    lang = await db.get_user_language(callback.from_user.id)
+    text = t("regions_title", lang)
     try:
-        await callback.message.edit_text(text, reply_markup=get_regions_keyboard(), parse_mode="HTML")
+        await callback.message.edit_text(text, reply_markup=get_regions_keyboard(lang), parse_mode="HTML")
         await callback.answer()
     except Exception:
         await callback.answer()
@@ -285,13 +325,33 @@ async def cb_regions_list(callback: CallbackQuery):
 
 @router.callback_query(F.data == "back_to_main_menu")
 async def cb_back_to_main_menu(callback: CallbackQuery):
+    lang = await db.get_user_language(callback.from_user.id)
+    user_name = callback.from_user.full_name or "Mijoz"
+
     try:
         await callback.message.delete()
     except Exception:
         pass
+
+    welcome_text = t("welcome_caption", lang, name=user_name, company=config.COMPANY_NAME)
+    if os.path.exists(BANNER_PATH):
+        try:
+            banner_file = FSInputFile(BANNER_PATH)
+            await callback.message.answer_photo(
+                photo=banner_file,
+                caption=welcome_text,
+                reply_markup=get_customer_main_menu_keyboard(lang),
+                parse_mode="HTML"
+            )
+            await callback.answer()
+            return
+        except Exception:
+            pass
+
     await callback.message.answer(
-        "Asosiy menyudasiz. Kerakli bo'limni tanlang:",
-        reply_markup=get_customer_main_menu_keyboard()
+        welcome_text,
+        reply_markup=get_customer_main_menu_keyboard(lang),
+        parse_mode="HTML"
     )
     await callback.answer()
 
@@ -300,24 +360,32 @@ async def cb_back_to_main_menu(callback: CallbackQuery):
 async def cb_queue_from_region(callback: CallbackQuery, bot: Bot):
     region_key = callback.data.split(":")[1]
     reg = CONTRACT_REGIONS.get(region_key, {})
-    reg_name = reg.get("name", "Hudud")
+    lang = await db.get_user_language(callback.from_user.id)
+    reg_name = reg.get("name_ru" if lang == "ru" else "name", "Hudud")
 
-    subject = f"📝 Shartnoma ({reg_name})"
-    await callback.answer("Operator navbatiga ulanmoqdasiz...")
+    if lang == "ru":
+        subject = f"По вопросам договоров — {reg_name}"
+        ans_toast = "Подключение к очереди операторов..."
+    else:
+        subject = f"Shartnoma masalasida — {reg_name}"
+        ans_toast = "Operator navbatiga ulanmoqdasiz..."
+
+    await callback.answer(ans_toast)
     await _connect_customer_to_queue(callback.message, bot, subject)
 
 
 # ================= NAVBAT VA SUHBATNI BOSHQARISH =================
 
-@router.message(F.text == "ℹ️ Navbatimni tekshirish")
+@router.message(F.text.in_({"ℹ️ Navbatimni tekshirish", "ℹ️ Проверить очередь"}))
 async def check_queue_position(message: Message):
+    lang = await db.get_user_language(message.from_user.id)
+
     # Agar foydalanuvchi allaqachon suhbatda bo'lsa
     active_sess = await db.get_active_session_by_customer(message.from_user.id)
     if active_sess:
         await message.answer(
-            f"💬 Siz hozirda operator <b>{active_sess['operator_name']}</b> bilan muloqotdasiz.\n\n"
-            "Savollaringizni to'g'ridan-to'g'ri yozishingiz mumkin.",
-            reply_markup=get_customer_active_keyboard(),
+            t("in_active_chat", lang, operator_name=active_sess['operator_name']),
+            reply_markup=get_customer_active_keyboard(lang),
             parse_mode="HTML"
         )
         return
@@ -329,38 +397,35 @@ async def check_queue_position(message: Message):
         avail = eta["available_operators"]
         est_min = eta["est_minutes"]
         est_max = eta["est_max"]
+
         if online == 0:
-            status_desc = "🔴 Barcha operatorlar tanaffusda, tez orada sizga ulanamiz."
+            status_desc = t("queue_all_offline", lang)
         elif ahead == 0 and avail > 0:
-            status_desc = "🟢 Navbatingiz yetib keldi, operator ulanmoqda!"
+            status_desc = t("queue_routed", lang)
         else:
-            ahead_text = f"\n👥 <b>Sizdan oldin:</b> {ahead} ta murojaat bor" if ahead > 0 else ""
-            status_desc = (
-                "🟡 <b>Hozirda barcha operatorlarimiz mijozlar bilan muloqotda.</b>\n"
-                f"⏱ <b>Taxminiy kutish vaqti:</b> ~{est_min}–{est_max} daqiqa{ahead_text}"
-            )
+            ahead_text = (t("queue_ahead_count", lang, ahead=ahead) + "\n") if ahead > 0 else ""
+            status_desc = t("queue_busy", lang, est_min=est_min, est_max=est_max, ahead_text=ahead_text)
 
         await message.answer(
-            f"📍 <b>Murojaatingiz holati (Ticket #{eta['ticket_id']}):</b>\n\n"
-            f"{status_desc}\n\n"
-            "<i>Iltimos, operator bog'lanishini kuting.</i>",
+            t("queue_status_title", lang, status_desc=status_desc),
+            reply_markup=get_customer_queue_keyboard(lang),
             parse_mode="HTML"
         )
     else:
         await message.answer(
-            "Siz hozirda navbatda emassiz. Yangi murojaat boshlash uchun bo'limni tanlang:",
-            reply_markup=get_customer_main_menu_keyboard()
+            t("not_in_queue", lang),
+            reply_markup=get_customer_main_menu_keyboard(lang)
         )
 
 
-@router.message(F.text == "❌ Navbatdan chiqish")
+@router.message(F.text.in_({"❌ Navbatdan chiqish", "❌ Выйти из очереди"}))
 async def cancel_queue(message: Message):
+    lang = await db.get_user_language(message.from_user.id)
     active_sess = await db.get_active_session_by_customer(message.from_user.id)
     if active_sess:
         await message.answer(
-            f"⚠️ Siz hozirda operator <b>{active_sess['operator_name']}</b> bilan jonli muloqotdasiz.\n\n"
-            "Suhbatni yakunlash uchun pastdagi <b>«❌ Suhbatni yakunlash»</b> tugmasini bosing:",
-            reply_markup=get_customer_active_keyboard(),
+            t("in_active_chat", lang, operator_name=active_sess['operator_name']),
+            reply_markup=get_customer_active_keyboard(lang),
             parse_mode="HTML"
         )
         return
@@ -376,33 +441,31 @@ async def cancel_queue(message: Message):
             await conn.commit()
 
         await message.answer(
-            "Siz navbatdan chiqdingiz. Kerakli bo'limni tanlang:",
-            reply_markup=get_customer_main_menu_keyboard()
+            t("queue_cancelled", lang),
+            reply_markup=get_customer_main_menu_keyboard(lang)
         )
     else:
         await message.answer(
-            "Siz hozirda navbatda emassiz.",
-            reply_markup=get_customer_main_menu_keyboard()
+            t("not_in_queue", lang),
+            reply_markup=get_customer_main_menu_keyboard(lang)
         )
 
 
-@router.message(F.text == "❌ Suhbatni yakunlash")
+@router.message(F.text.in_({"❌ Suhbatni yakunlash", "❌ Завершить диалог"}))
 async def customer_end_chat(message: Message, bot: Bot):
+    lang = await db.get_user_language(message.from_user.id)
     session = await db.close_session_by_customer(message.from_user.id)
     if not session:
         await message.answer(
-            "Hozir faol suhbat mavjud emas. Yangi murojaat uchun bo'limni tanlang:",
-            reply_markup=get_customer_main_menu_keyboard()
+            t("not_in_queue", lang),
+            reply_markup=get_customer_main_menu_keyboard(lang)
         )
         return
 
     operator_id = session["operator_id"]
     ticket_id = session["ticket_id"]
 
-    farewell_text = (
-        f"{config.FAREWELL_TEMPLATE.format(company_name=config.COMPANY_NAME)}\n\n"
-        f"{config.RATING_PROMPT}"
-    )
+    farewell_text = t("chat_ended_by_user", lang)
 
     # Mijozga xayrlashuv va yulduzli baholash tugmalari
     await message.answer(
@@ -412,7 +475,6 @@ async def customer_end_chat(message: Message, bot: Bot):
     )
 
     # Operator chatidagi xabarlarni tozalash
-    from handlers.common import clean_up_operator_session_messages
     await clean_up_operator_session_messages(bot, session["id"], operator_id)
 
     # Operatorga xabar
@@ -431,20 +493,103 @@ async def customer_end_chat(message: Message, bot: Bot):
         pass
 
 
+# ================= BAHOLASH VA FIKR-MULOHAZALAR (FEEDBACK) =================
+
 @router.callback_query(F.data.startswith("rate:"))
-async def cb_rate_service(callback: CallbackQuery):
+async def cb_rate_service(callback: CallbackQuery, state: FSMContext):
     parts = callback.data.split(":")
     ticket_id = int(parts[1])
     stars = int(parts[2])
+    lang = await db.get_user_language(callback.from_user.id)
 
     await db.save_session_rating(ticket_id, stars)
-    await callback.answer(f"Rahmat! {stars} ⭐ bilan baholadingiz.", show_alert=True)
+
+    if stars <= 3:
+        # Past baho qo'yilganda sababini so'raymiz
+        ans_toast = f"Оценка {stars} ⭐ принята." if lang == "ru" else f"Bahoyingiz ({stars} ⭐) qabul qilindi."
+        await callback.answer(ans_toast)
+        try:
+            await callback.message.edit_text(
+                t("rating_low_ask", lang),
+                reply_markup=get_negative_feedback_keyboard(ticket_id, lang=lang),
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+    else:
+        # Yuqori baho (4 yoki 5 ⭐)
+        stars_str = f"{stars} ⭐"
+        thanks_toast = f"Спасибо за оценку {stars_str}!" if lang == "ru" else f"Rahmat! {stars_str} bilan baholadingiz."
+        await callback.answer(thanks_toast, show_alert=True)
+        try:
+            await callback.message.edit_text(
+                t("rating_thanks", lang, stars=stars_str),
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
+
+@router.callback_query(F.data.startswith("reason:"))
+async def cb_feedback_reason(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split(":")
+    ticket_id = int(parts[1])
+    code = parts[2]
+    lang = await db.get_user_language(callback.from_user.id)
+
+    if code == "skip":
+        skip_toast = "Пропущено." if lang == "ru" else "O'tkazib yuborildi."
+        await callback.answer(skip_toast)
+        try:
+            await callback.message.edit_text(
+                t("feedback_skipped", lang),
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+        return
+
+    if code == "custom":
+        await state.set_state(CustomerFeedbackState.waiting_for_reason)
+        await state.update_data(ticket_id=ticket_id, lang=lang)
+        await callback.answer()
+        try:
+            await callback.message.edit_text(
+                t("custom_reason_prompt", lang),
+                reply_markup=None,
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+        return
+
+    reason_text = get_reason_text(code, lang)
+    await db.save_session_feedback(ticket_id, reason_text)
+    saved_toast = "Отзыв принят!" if lang == "ru" else "Fikringiz qabul qilindi!"
+    await callback.answer(saved_toast, show_alert=True)
     try:
         await callback.message.edit_text(
-            f"✅ <b>Katta rahmat!</b>\n"
-            f"Siz ko'rsatilgan xizmat sifatini <b>{stars} ⭐</b> bilan baholadingiz.\n\n"
-            "<i>«{company}» xizmatlaridan foydalanganingiz uchun tashakkur! Yangi murojaat uchun /start bosing.</i>".format(company=config.COMPANY_NAME),
+            f"✅ {t('feedback_saved', lang)}\n\n"
+            f"<i>({reason_text})</i>",
             parse_mode="HTML"
         )
     except Exception:
         pass
+
+
+@router.message(CustomerFeedbackState.waiting_for_reason)
+async def process_custom_feedback_reason(message: Message, state: FSMContext):
+    data = await state.get_data()
+    ticket_id = data.get("ticket_id")
+    lang = data.get("lang") or await db.get_user_language(message.from_user.id)
+    custom_text = (message.text or "").strip()
+    await state.clear()
+
+    if ticket_id and custom_text:
+        await db.save_session_feedback(ticket_id, custom_text[:500])
+
+    await message.answer(
+        t("feedback_saved", lang),
+        reply_markup=get_customer_main_menu_keyboard(lang),
+        parse_mode="HTML"
+    )
